@@ -1,0 +1,13 @@
+# Copy to terraform.tfvars and replace with your own values:
+#   cp terraform.tfvars.example terraform.tfvars
+# (terraform.tfvars is gitignored)
+
+key_name   = "your-key-name"      # An EC2 key pair that already exists in AWS
+my_ip_cidr = "203.0.113.10/32"    # Output of `curl -s ifconfig.me`, plus /32
+
+# Optional below; omitting them uses the defaults in variables.tf
+# region               = "ap-northeast-1"
+# master_instance_type = "t3.medium"
+# worker_instance_type = "t3.medium"
+# worker_count         = 2
+# root_volume_size     = 30

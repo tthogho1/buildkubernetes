@@ -1,0 +1,21 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+tfplan
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# Ansible
+*.retry
+
+# Never commit private keys or kubeconfig
+*.pem
+kubeconfig
+
+# Editor swap files
+*.swp
+*.swo
+*~

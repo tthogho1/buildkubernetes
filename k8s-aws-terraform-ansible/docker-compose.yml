@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  k8s-builder:
+    build: .
+    volumes:
+      - .:/workspace
+      - ~/.aws:/root/.aws:ro
+      - ~/.ssh:/root/.ssh:ro
+    working_dir: /workspace
+    environment:
+      - AWS_PROFILE=k8s-handson
+    stdin_open: true
+    tty: true

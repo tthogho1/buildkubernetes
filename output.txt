@@ -1,0 +1,715 @@
+AWS EC2 上に Terraform と Ansible で Kubernetes クラスターを構築するハンズオン資料です。
+
+• Terraform: VPC・サブネット・セキュリティグループ・EC2 インスタンス（master/worker）をプロビジョニング
+• Ansible: EC2 上に containerd と kubeadm/kubelet/kubectl をインストールし、kubeadm でクラスター初期化・結合・CNI 適用まで実施
+• 前提: ローカル PC（または CloudShell 相当）で AWS CLI・Terraform・Ansible が利用可能
+
+想定バージョン: Ubuntu 22.04 LTS / Kubernetes v1.31 / Calico v3.29.1
+
+
+---
+
+前提条件・準備
+
+必要なツール
+
+• AWS CLI（認証済み）
+• Terraform CLI（v1.5 以上）
+• Ansible（v2.14 以上）
+• SSH キーペア（EC2 接続用。AWS 側に作成済みのキーペアと、手元の .pem ファイル）
+
+認証・リージョン設定
+
+
+aws configure
+# Access Key / Secret Key / region (例: ap-northeast-1) / output (json)
+
+Terraform 用にも同じ認証情報が必要。環境変数でも OK：
+
+
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_DEFAULT_REGION=ap-northeast-1
+
+秘密鍵のパーミッションは 600 にしておくこと（でないと SSH が拒否されます）：
+
+
+chmod 600 ~/.ssh/your-key.pem
+
+
+---
+
+ハンズオン全体の流れ
+
+1. Terraform で VPC・EC2（master 1 台 + worker 2 台）を作成
+2. Ansible で全ノードに containerd、kubeadm、kubelet、kubectl をインストール
+3. Ansible で master ノードを kubeadm init、worker ノードを kubeadm join
+4. CNI（Calico）を適用してクラスター完成
+5. kubectl で確認・デプロイ検証
+
+
+---
+
+1. Terraform で EC2 インフラを構築
+
+ディレクトリ構成例
+
+
+k8s-aws-terraform-ansible/
+├─ terraform/
+│  ├─ main.tf
+│  ├─ variables.tf
+│  ├─ outputs.tf
+├─ ansible/
+│  ├─ inventory.ini
+│  ├─ playbooks/
+│     ├─ 01_deps.yml
+│     ├─ 02_k8s_init.yml
+│     ├─ 03_cni.yml
+└─ README.md
+
+terraform/variables.tf
+
+
+variable "region" {
+  type    = string
+  default = "ap-northeast-1"
+}
+
+variable "key_name" {
+  type        = string
+  description = "EC2 key pair name (already created in AWS)"
+}
+
+variable "my_ip_cidr" {
+  type        = string
+  description = "Your global IP in CIDR form, e.g. 203.0.113.10/32 (curl ifconfig.me)"
+}
+
+variable "master_instance_type" {
+  type    = string
+  default = "t3.medium" # kubeadm は最低 2 vCPU / 2GB RAM が必要
+}
+
+variable "worker_instance_type" {
+  type    = string
+  default = "t3.medium"
+}
+
+variable "worker_count" {
+  type    = number
+  default = 2
+}
+
+variable "root_volume_size" {
+  type    = number
+  default = 30 # Ubuntu AMI の既定 8GB ではイメージ展開で容量不足になる
+}
+
+terraform/main.tf
+
+
+terraform {
+  required_version = ">= 1.5.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.region
+}
+
+# VPC
+resource "aws_vpc" "k8s_vpc" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+
+  tags = {
+    Name = "k8s-vpc"
+  }
+}
+
+# Public subnet
+resource "aws_subnet" "k8s_subnet" {
+  vpc_id                  = aws_vpc.k8s_vpc.id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "${var.region}a"
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "k8s-subnet"
+  }
+}
+
+# Internet Gateway
+resource "aws_internet_gateway" "k8s_igw" {
+  vpc_id = aws_vpc.k8s_vpc.id
+
+  tags = {
+    Name = "k8s-igw"
+  }
+}
+
+# Route table
+resource "aws_route_table" "k8s_rt" {
+  vpc_id = aws_vpc.k8s_vpc.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.k8s_igw.id
+  }
+
+  tags = {
+    Name = "k8s-rt"
+  }
+}
+
+resource "aws_route_table_association" "k8s_rta" {
+  subnet_id      = aws_subnet.k8s_subnet.id
+  route_table_id = aws_route_table.k8s_rt.id
+}
+
+# Security Group（ノード間は全開放、外部からは自 IP のみ）
+resource "aws_security_group" "k8s_sg" {
+  name        = "k8s-sg"
+  description = "Security group for K8s nodes"
+  vpc_id      = aws_vpc.k8s_vpc.id
+
+  # SSH（自 IP のみ）
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.my_ip_cidr]
+  }
+
+  # kube-apiserver（自 IP のみ）
+  ingress {
+    from_port   = 6443
+    to_port     = 6443
+    protocol    = "tcp"
+    cidr_blocks = [var.my_ip_cidr]
+  }
+
+  # NodePort 動作確認用（自 IP のみ）
+  ingress {
+    from_port   = 30000
+    to_port     = 32767
+    protocol    = "tcp"
+    cidr_blocks = [var.my_ip_cidr]
+  }
+
+  # ノード間通信（同じ SG に属するインスタンス間は全許可）
+  # protocol = "-1" の場合、from_port / to_port は 0 でなければならない
+  ingress {
+    from_port = 0
+    to_port   = 0
+    protocol  = "-1"
+    self      = true
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "k8s-sg"
+  }
+}
+
+# Ubuntu 22.04 LTS AMI 取得
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+# Master EC2
+resource "aws_instance" "k8s_master" {
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.master_instance_type
+  key_name               = var.key_name
+  subnet_id              = aws_subnet.k8s_subnet.id
+  vpc_security_group_ids = [aws_security_group.k8s_sg.id]
+
+  root_block_device {
+    volume_size = var.root_volume_size
+    volume_type = "gp3"
+  }
+
+  tags = {
+    Name = "k8s-master"
+    Role = "master"
+  }
+}
+
+# Worker EC2（count で複数台）
+resource "aws_instance" "k8s_worker" {
+  count                  = var.worker_count
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.worker_instance_type
+  key_name               = var.key_name
+  subnet_id              = aws_subnet.k8s_subnet.id
+  vpc_security_group_ids = [aws_security_group.k8s_sg.id]
+
+  root_block_device {
+    volume_size = var.root_volume_size
+    volume_type = "gp3"
+  }
+
+  tags = {
+    Name = "k8s-worker-${count.index}"
+    Role = "worker"
+  }
+}
+
+terraform/outputs.tf
+
+
+output "master_public_ip" {
+  value = aws_instance.k8s_master.public_ip
+}
+
+output "master_private_ip" {
+  value = aws_instance.k8s_master.private_ip
+}
+
+output "worker_public_ips" {
+  value = aws_instance.k8s_worker[*].public_ip
+}
+
+Terraform 実行
+
+
+cd terraform
+terraform init
+terraform plan \
+  -var="key_name=your-key-name" \
+  -var="my_ip_cidr=$(curl -s ifconfig.me)/32" \
+  -out=tfplan
+terraform apply tfplan
+
+出力例：
+
+
+master_public_ip    = "3.112.xxx.xxx"
+master_private_ip   = "10.0.1.10"
+worker_public_ips   = ["13.230.xxx.xxx", "13.231.xxx.xxx"]
+
+この IP を元に Ansible のインベントリを作成します。
+
+
+---
+
+2. Ansible インベントリ作成
+
+ansible/inventory.ini（例）：
+
+
+[masters]
+master ansible_host=3.112.xxx.xxx
+
+[workers]
+worker1 ansible_host=13.230.xxx.xxx
+worker2 ansible_host=13.231.xxx.xxx
+
+[all:vars]
+ansible_user=ubuntu
+ansible_ssh_private_key_file=~/.ssh/your-key.pem
+ansible_python_interpreter=/usr/bin/python3
+ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'
+
+SSH 接続確認：
+
+
+ansible all -i ansible/inventory.ini -m ping
+
+（EC2 の起動直後は SSH が上がりきっていないことがあります。失敗したら 1 分ほど待って再実行）
+
+
+---
+
+3. Ansible Playbook：コンテナランタイム・K8s パッケージ導入
+
+Kubernetes v1.24 で dockershim が削除されたため、コンテナランタイムは containerd（CRI 対応）を使います。
+Docker Engine（docker-ce）を入れても kubelet からは利用できません。
+
+ansible/playbooks/01_deps.yml
+
+
+- name: Install Kubernetes dependencies on all nodes
+  hosts: all
+  become: true
+  vars:
+    k8s_minor: "v1.31"
+
+  tasks:
+    # --- kubeadm の前提条件（swap 無効・カーネルモジュール・sysctl）---
+    - name: Disable swap immediately
+      command: swapoff -a
+      when: ansible_swaptotal_mb | int > 0
+
+    - name: Disable swap permanently in /etc/fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s.*)$'
+        replace: '# \1'
+
+    - name: Load required kernel modules at boot
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: "0644"
+
+    - name: Load kernel modules now
+      # community.general.modprobe は使わない（ansible-core 単体だと解決できない）。
+      # modprobe は既にロード済みでも exit 0 なので冪等。
+      command: "modprobe {{ item }}"
+      loop:
+        - overlay
+        - br_netfilter
+      changed_when: false
+
+    - name: Set sysctl params required by kubeadm
+      copy:
+        dest: /etc/sysctl.d/99-kubernetes.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+        mode: "0644"
+      notify: Reload sysctl
+
+    # --- リポジトリ設定（apt_key は非推奨のため keyring 方式）---
+    - name: Install common packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          # kubeadm の preflight が必須とするコマンド群。
+          # Ubuntu の最小 AMI には入っておらず、kubelet の依存にも含まれない。
+          - conntrack
+          - socat
+          - ethtool
+        state: present
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Create apt keyring directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Add Docker GPG key (dearmored)
+      shell: |
+        set -o pipefail
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+          | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      args:
+        executable: /bin/bash
+        creates: /etc/apt/keyrings/docker.gpg
+
+    - name: Add Docker repository (provides containerd.io)
+      apt_repository:
+        repo: >-
+          deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg]
+          https://download.docker.com/linux/ubuntu
+          {{ ansible_distribution_release }} stable
+        filename: docker
+        state: present
+
+    - name: Install containerd
+      apt:
+        name: containerd.io
+        state: present
+        update_cache: yes
+
+    # --- containerd 設定（docker-ce 版は既定で CRI プラグインが無効）---
+    # containerd.io パッケージは disabled_plugins = ["cri"] だけを書いた
+    # config.toml を同梱する。単純な creates: による存在チェックでは生成が
+    # スキップされ、CRI が無効のまま kubeadm init が失敗する。
+    - name: Check containerd config state
+      shell: |
+        test -f /etc/containerd/config.toml || exit 2   # 未作成
+        grep -q 'disabled_plugins.*"cri"' /etc/containerd/config.toml && exit 0  # 同梱スタブ
+        exit 1                                          # 生成済み
+      args:
+        executable: /bin/bash
+      register: containerd_cfg_state
+      failed_when: false
+      changed_when: false
+
+    - name: Generate containerd config with CRI enabled
+      shell: containerd config default > /etc/containerd/config.toml
+      when: containerd_cfg_state.rc != 1
+      notify: Restart containerd
+
+    - name: Use systemd cgroup driver (kubelet の既定に合わせる)
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+      notify: Restart containerd
+
+    - name: Ensure containerd is running and enabled
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+
+    # --- Kubernetes パッケージ ---
+    - name: Add Kubernetes GPG key
+      shell: |
+        set -o pipefail
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/{{ k8s_minor }}/deb/Release.key \
+          | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        executable: /bin/bash
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes repository
+      apt_repository:
+        repo: >-
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg]
+          https://pkgs.k8s.io/core:/stable:/{{ k8s_minor }}/deb/ /
+        filename: kubernetes
+        state: present
+
+    - name: Install kubelet, kubeadm, kubectl
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: Hold kube packages (自動アップグレードでクラスターを壊さない)
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Enable kubelet
+      systemd:
+        name: kubelet
+        enabled: yes
+
+  handlers:
+    - name: Reload sysctl
+      command: sysctl --system
+
+    - name: Restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+実行：
+
+
+ansible-playbook -i ansible/inventory.ini ansible/playbooks/01_deps.yml
+
+
+---
+
+4. Ansible Playbook：kubeadm でクラスター初期化・結合
+
+--apiserver-advertise-address にはノードの NIC に実際に付いている
+プライベート IP を指定します（EC2 のパブリック IP はインターフェースに存在しないため、
+指定すると kubeadm init が失敗します）。手元から kubectl したい場合に備えて、
+パブリック IP は --apiserver-cert-extra-sans で証明書の SAN に追加しておきます。
+
+ansible/playbooks/02_k8s_init.yml
+
+
+- name: Initialize Kubernetes control-plane
+  hosts: masters
+  become: true
+  tasks:
+    - name: Initialize cluster with kubeadm
+      command: >
+        kubeadm init
+        --pod-network-cidr=192.168.0.0/16
+        --apiserver-advertise-address={{ ansible_default_ipv4.address }}
+        --apiserver-cert-extra-sans={{ ansible_host }}
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Prepare .kube directory for ubuntu user
+      file:
+        path: /home/ubuntu/.kube
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0755"
+
+    - name: Copy admin.conf to user's kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/ubuntu/.kube/config
+        remote_src: yes
+        owner: ubuntu
+        group: ubuntu
+        mode: "0600" # クライアント証明書と鍵を含むため他ユーザーに読ませない
+
+    - name: Generate join command
+      command: kubeadm token create --print-join-command
+      register: join_cmd
+      changed_when: false
+      no_log: true # トークンをログに残さない
+
+- name: Join worker nodes to the cluster
+  hosts: workers
+  become: true
+  tasks:
+    - name: Join cluster
+      command: "{{ hostvars[groups['masters'][0]]['join_cmd']['stdout'] }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+      no_log: true
+
+実行：
+
+
+ansible-playbook -i ansible/inventory.ini ansible/playbooks/02_k8s_init.yml
+
+補足：join コマンドは master 上で register した値を hostvars 経由で worker に渡しています。
+トークンを含むファイルをディスク上に残さないための書き方です。
+
+
+---
+
+5. Ansible Playbook：CNI（Calico）適用
+
+ansible/playbooks/03_cni.yml
+
+
+- name: Apply CNI (Calico)
+  hosts: masters
+  become: true
+  vars:
+    calico_version: "v3.29.1" # パッチまで含む完全なタグを指定する
+  tasks:
+    - name: Apply Calico manifest
+      command: >
+        kubectl apply -f
+        https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/calico.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_apply
+      changed_when: "'created' in calico_apply.stdout or 'configured' in calico_apply.stdout"
+
+    - name: Wait for all nodes to become Ready
+      command: kubectl wait --for=condition=Ready nodes --all --timeout=300s
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      changed_when: false
+
+kubectl apply 自体が冪等なので、フラグファイルによる制御は不要です。
+
+実行：
+
+
+ansible-playbook -i ansible/inventory.ini ansible/playbooks/03_cni.yml
+
+
+---
+
+6. クラスター確認・動作検証
+
+master ノードで：
+
+
+ssh -i ~/.ssh/your-key.pem ubuntu@<master-public-ip>
+kubectl get nodes
+kubectl get pods -A
+
+全ノードが Ready、kube-system の Pod が Running になっていれば成功です。
+
+サンプルデプロイ（nginx）：
+
+
+kubectl create deployment nginx --image=nginx
+kubectl expose deployment nginx --port=80 --type=NodePort
+kubectl get svc nginx
+
+割り当てられた NodePort（30000-32767）は Terraform の SG で自 IP に対して開放済みなので、
+http://<いずれかのノードのパブリック IP>:<NodePort> でブラウザからアクセスできます。
+
+（任意）手元の PC から kubectl を使う場合：
+
+
+scp -i ~/.ssh/your-key.pem ubuntu@<master-public-ip>:~/.kube/config ./kubeconfig
+# server の private IP をパブリック IP に書き換える
+sed -i '' "s#server: https://10\..*:6443#server: https://<master-public-ip>:6443#" ./kubeconfig
+export KUBECONFIG=$PWD/kubeconfig
+kubectl get nodes
+
+（--apiserver-cert-extra-sans にパブリック IP を入れてあるので証明書エラーになりません）
+
+
+---
+
+7. クリーンアップ
+
+EC2 ごと削除すればクラスターも消えます：
+
+
+cd terraform
+terraform destroy \
+  -var="key_name=your-key-name" \
+  -var="my_ip_cidr=$(curl -s ifconfig.me)/32"
+
+
+---
+
+つまずきやすいポイント
+
+• swap が有効なままだと kubeadm init が preflight エラーで停止します（01_deps.yml で無効化済み）。
+• br_netfilter の未ロード / net.ipv4.ip_forward=0 も同様に preflight で弾かれます。
+• containerd を docker-ce リポジトリから入れた場合、既定の config.toml は CRI プラグインが
+  無効なため、containerd config default で生成し直す必要があります。
+• cgroup ドライバが containerd（cgroupfs）と kubelet（systemd）で食い違うと、
+  init は通っても Pod が起動しません。SystemdCgroup = true を必ず設定します。
+• 一度失敗した後にやり直す場合は、対象ノードで sudo kubeadm reset -f してから再実行します。
+
+
+---
+
+補足・発展
+
+• Kubespray 利用: 本番寄りの構成やバージョン管理を重視する場合は、Kubespray（Ansible ベースの
+  K8s ディストリビューション）を Terraform で作成した EC2 に対して実行する構成も一般的です。
+• 冗長化: 本番では control-plane を 3 台にして NLB を前段に置き、etcd をクォーラム構成にします。
+• プライベートサブネット + SSM: セキュリティ強化のため、パブリック IP を持たせず
+  AWS SSM Session Manager で接続する構成も可能です。
+• インベントリの自動生成: terraform output -json を jq で加工して inventory.ini を
+  生成すれば、IP の手書きコピーを省けます。

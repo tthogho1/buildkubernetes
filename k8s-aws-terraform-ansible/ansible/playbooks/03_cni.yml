@@ -1,0 +1,20 @@
+- name: Apply CNI (Calico)
+  hosts: masters
+  become: true
+  vars:
+    calico_version: "v3.29.1" # Use a full tag including the patch version
+  tasks:
+    - name: Apply Calico manifest
+      command: >
+        kubectl apply -f
+        https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/calico.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_apply
+      changed_when: "'created' in calico_apply.stdout or 'configured' in calico_apply.stdout"
+
+    - name: Wait for all nodes to become Ready
+      command: kubectl wait --for=condition=Ready nodes --all --timeout=300s
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      changed_when: false
