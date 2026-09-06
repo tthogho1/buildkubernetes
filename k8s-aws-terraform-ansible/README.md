@@ -8,8 +8,8 @@ A hands-on for building a Kubernetes cluster on AWS EC2 with Terraform and Ansib
 
 Target versions: Ubuntu 22.04 LTS / Kubernetes v1.31 / Calico v3.29.1
 
-The narrative walkthrough lives outside this directory in `../output.txt`
-(written in Japanese). The files here were extracted from it verbatim.
+The step-by-step walkthrough lives outside this directory in
+[`../README.md`](../README.md), which embeds the files here verbatim.
 
 ## Infrastructure specification
 
