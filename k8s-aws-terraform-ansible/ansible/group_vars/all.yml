@@ -1,0 +1,3 @@
+# Cluster-wide Ansible variables, editable from the management console (console/).
+k8s_minor: "v1.31"        # Kubernetes minor release for the pkgs.k8s.io apt repo
+calico_version: "v3.29.1" # Use a full tag including the patch version

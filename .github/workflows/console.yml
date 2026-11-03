@@ -1,0 +1,143 @@
+# Build the Fyne settings console (k8s-aws-terraform-ansible/console) for
+# Linux, Windows and macOS. Pushing a tag like `console-v1.0.0` also publishes
+# a GitHub Release with the binaries attached.
+name: console
+
+on:
+  push:
+    branches: [main]
+    tags: ["console-v*"]
+    paths:
+      - "k8s-aws-terraform-ansible/console/**"
+      - ".github/workflows/console.yml"
+  pull_request:
+    paths:
+      - "k8s-aws-terraform-ansible/console/**"
+      - ".github/workflows/console.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: k8s-aws-terraform-ansible/console
+    shell: bash
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-amd64,      runner: ubuntu-24.04 }
+          - { name: linux-arm64,      runner: ubuntu-24.04-arm }
+          - { name: windows-amd64,    runner: windows-latest }
+          - { name: darwin-universal, runner: macos-latest }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: k8s-aws-terraform-ansible/console/go.mod
+          cache-dependency-path: k8s-aws-terraform-ansible/console/go.sum
+
+      # Fyne needs cgo plus the GL/X11 headers on Linux. Windows runners ship
+      # MinGW-w64 gcc and macOS runners ship clang, so nothing to install there.
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc libgl1-mesa-dev xorg-dev libxkbcommon-dev
+
+      - name: Version
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/console-v* ]]; then
+            v="${GITHUB_REF_NAME#console-}"
+          else
+            v="dev-${GITHUB_SHA::7}"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Vet and test
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w -X main.version=${{ steps.ver.outputs.version }}" \
+            -o dist/k8s-console .
+          tar -C dist -czf "k8s-console-${{ matrix.name }}.tar.gz" k8s-console
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          mkdir -p dist
+          # windowsgui: no console window behind the app.
+          go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=${{ steps.ver.outputs.version }}" \
+            -o dist/k8s-console.exe .
+          7z a -tzip "k8s-console-${{ matrix.name }}.zip" ./dist/k8s-console.exe
+
+      - name: Build (macOS universal)
+        if: runner.os == 'macOS'
+        env:
+          CGO_ENABLED: "1"
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          mkdir -p dist
+          ld="-s -w -X main.version=${{ steps.ver.outputs.version }}"
+          GOARCH=arm64 CC="clang -arch arm64"  go build -trimpath -ldflags "$ld" -o dist/k8s-console-arm64 .
+          GOARCH=amd64 CC="clang -arch x86_64" go build -trimpath -ldflags "$ld" -o dist/k8s-console-amd64 .
+          lipo -create -output dist/k8s-console dist/k8s-console-arm64 dist/k8s-console-amd64
+          lipo -info dist/k8s-console
+          tar -C dist -czf "k8s-console-${{ matrix.name }}.tar.gz" k8s-console
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: k8s-console-${{ matrix.name }}
+          path: |
+            k8s-aws-terraform-ansible/console/k8s-console-*.tar.gz
+            k8s-aws-terraform-ansible/console/k8s-console-*.zip
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/console-v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum k8s-console-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "k8s console ${GITHUB_REF_NAME#console-}" \
+            --generate-notes \
+            --verify-tag

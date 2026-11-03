@@ -90,12 +90,15 @@ k8s-aws-terraform-ansible/
 ├─ ansible/
 │  ├─ ansible.cfg
 │  ├─ inventory.ini        # Replace the IPs with the terraform output values
+│  ├─ group_vars/
+│  │  └─ all.yml           # k8s_minor, calico_version
 │  └─ playbooks/
 │     ├─ 01_deps.yml       # containerd + kubeadm/kubelet/kubectl
 │     ├─ 02_k8s_init.yml   # kubeadm init / join
 │     └─ 03_cni.yml        # Calico
 ├─ iam/
 │  └─ k8s-handson-policy.json   # Permissions for the executing IAM user
+├─ console/                     # Go + Fyne desktop app for editing tfvars / Ansible vars
 ├─ cluster.sh                   # One-command wrapper (up / down / status / ssh)
 └─ README.md
 ```
@@ -418,6 +421,17 @@ ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'
 The checked-in IPs are RFC 5737 documentation placeholders. Replace them with the values
 from `terraform output`, or let `./cluster.sh inventory` fill them in for you.
 
+### `ansible/group_vars/all.yml`
+
+```yaml
+# Cluster-wide Ansible variables, editable from the management console (console/).
+k8s_minor: "v1.31"        # Kubernetes minor release for the pkgs.k8s.io apt repo
+calico_version: "v3.29.1" # Use a full tag including the patch version
+```
+
+Ansible loads `group_vars/` next to the inventory automatically, so the playbooks read
+these values without declaring them.
+
 Check SSH connectivity:
 
 ```bash
@@ -439,8 +453,7 @@ speaks CRI). Installing Docker Engine (`docker-ce`) gives kubelet nothing it can
 - name: Install Kubernetes dependencies on all nodes
   hosts: all
   become: true
-  vars:
-    k8s_minor: "v1.31"
+  # k8s_minor comes from ansible/group_vars/all.yml
 
   tasks:
     # --- kubeadm prerequisites: swap off, kernel modules, sysctl ---
@@ -695,8 +708,7 @@ Note: the join command is registered on the master and passed to the workers thr
 - name: Apply CNI (Calico)
   hosts: masters
   become: true
-  vars:
-    calico_version: "v3.29.1" # Use a full tag including the patch version
+  # calico_version comes from ansible/group_vars/all.yml
   tasks:
     - name: Apply Calico manifest
       command: >
@@ -777,12 +789,28 @@ separately:
 ./cluster.sh ssh       # SSH into the master
 ./cluster.sh down      # Destroy everything
 ./cluster.sh inventory # Refresh ansible/inventory.ini from terraform output
+./cluster.sh scale 3   # Change the number of workers (drains removed nodes first)
 ```
 
 `up` runs preflight checks (required tools, SSH key, AWS credentials, and whether your
 global IP still matches `my_ip_cidr`), applies the Terraform, refreshes
 `ansible/inventory.ini` from the outputs, waits for SSH, then runs all three playbooks in
 order. It prompts once before creating billable resources; add `-y` to skip that.
+
+`./cluster.sh scale N` changes the number of workers on a running cluster (1–10):
+
+- It plans with `worker_count=N` first, and refuses if the plan would change anything
+  other than adding or removing workers. One case is a master replacement because
+  Canonical published a newer Ubuntu AMI.
+- **Scaling down**: it runs `kubectl drain` and `kubectl delete node` on the
+  highest-numbered workers *before* Terraform destroys them.
+- **Scaling up**: it creates the new instances, refreshes the inventory, and runs the
+  playbooks only on the new workers (plus the master, to get a join token).
+- It saves `worker_count` to `terraform.tfvars`, so a later `up` doesn't undo the change.
+  If no cluster is running, it only saves the value.
+
+Don't change the count of a running cluster with a plain `up` or `terraform apply`: they
+destroy workers without draining them.
 
 ### `cluster.sh`
 
@@ -796,6 +824,7 @@ order. It prompts once before creating billable resources; add `-y` to skip that
 #   ./cluster.sh status    Show cluster state
 #   ./cluster.sh ssh       SSH into the master node
 #   ./cluster.sh inventory Refresh ansible/inventory.ini from terraform output
+#   ./cluster.sh scale N   Change the number of workers (drains removed nodes first)
 #
 # Add -y to skip the confirmation prompt: ./cluster.sh up -y
 #
@@ -835,29 +864,48 @@ preflight() {
 }
 
 refresh_inventory() {
-  local m w0 w1
+  local m workers tmp
   m=$($TF output -raw master_public_ip)
-  read -r w0 w1 <<<"$($TF output -json worker_public_ips \
-        | python3 -c 'import json,sys; print(*json.load(sys.stdin))')"
-  [ -n "$m" ] && [ -n "$w0" ] && [ -n "$w1" ] || die "could not read terraform outputs"
+  workers=$($TF output -json worker_public_ips \
+        | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)))')
+  [ -n "$m" ] && [ -n "$workers" ] || die "could not read terraform outputs"
 
-  # Portable in-place sed for both macOS (BSD) and Linux (GNU) sed
-  if sed --version >/dev/null 2>&1; then
-    # GNU sed (Linux / Docker container)
-    sed -i \
-      -e "s/^master ansible_host=.*/master ansible_host=$m/" \
-      -e "s/^worker1 ansible_host=.*/worker1 ansible_host=$w0/" \
-      -e "s/^worker2 ansible_host=.*/worker2 ansible_host=$w1/" \
-      ansible/inventory.ini
-  else
-    # BSD sed (macOS)
-    sed -i '' \
-      -e "s/^master ansible_host=.*/master ansible_host=$m/" \
-      -e "s/^worker1 ansible_host=.*/worker1 ansible_host=$w0/" \
-      -e "s/^worker2 ansible_host=.*/worker2 ansible_host=$w1/" \
-      ansible/inventory.ini
-  fi
-  grn "inventory updated: master=$m worker1=$w0 worker2=$w1"
+  # Rewrite the master line and rebuild [workers] as worker1..workerN.
+  # awk (not sed -i) so it behaves the same with macOS (BSD) and Linux (GNU)
+  # tools. Every other line, including [all:vars], is kept as-is.
+  tmp=$(mktemp "ansible/inventory.ini.XXXXXX")
+  awk -v m="$m" -v ws="$workers" '
+    /^\[/ { in_workers = ($0 == "[workers]") }
+    /^master ansible_host=/ { print "master ansible_host=" m; next }
+    in_workers && /^worker[0-9]+ ansible_host=/ { next }
+    { print }
+    $0 == "[workers]" {
+      n = split(ws, w, " ")
+      for (i = 1; i <= n; i++) print "worker" i " ansible_host=" w[i]
+    }
+  ' ansible/inventory.ini > "$tmp"
+  cat "$tmp" > ansible/inventory.ini   # keep the original file's mode
+  rm -f "$tmp"
+  grn "inventory updated: master=$m workers=$workers"
+}
+
+# Set (or append) `key = value` in terraform.tfvars; portable like refresh_inventory.
+set_tfvar() {
+  local k="$1" v="$2" f="terraform/terraform.tfvars" tmp
+  [ -f "$f" ] || die "$f not found (cp terraform/terraform.tfvars.example $f)"
+  tmp=$(mktemp "$f.XXXXXX")
+  awk -v k="$k" -v v="$v" '
+    $0 ~ "^" k "[ \t]*=" { print k " = " v; done = 1; next }
+    { print }
+    END { if (!done) print k " = " v }
+  ' "$f" > "$tmp"
+  cat "$tmp" > "$f"
+  rm -f "$tmp"
+}
+
+worker_count_now() {
+  $TF output -json worker_public_ips 2>/dev/null \
+    | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))'
 }
 
 wait_for_ssh() {
@@ -876,7 +924,9 @@ wait_for_ssh() {
 cmd_up() {
   preflight
   if [ "${1:-}" != "-y" ]; then
-    bold "This creates 3x t3.medium in $REGION — roughly \$4-5/day."
+    local n
+    n=$(sed -n 's/^worker_count *= *\([0-9]*\).*/\1/p' terraform/terraform.tfvars 2>/dev/null)
+    bold "This creates 1 master + ${n:-2} workers in $REGION (~\$1.5/day per t3.medium node)."
     read -r -p "Continue? [y/N] " a
     [[ "$a" =~ ^[Yy]$ ]] || { echo "aborted"; exit 0; }
   fi
@@ -918,6 +968,95 @@ cmd_ssh() {
     "ubuntu@$($TF output -raw master_public_ip)"
 }
 
+cmd_scale() {
+  local want="${1:-}" yes="${2:-}" have i node
+  [[ "$want" =~ ^[0-9]+$ ]] && [ "$want" -ge 1 ] && [ "$want" -le 10 ] \
+    || die "usage: ./cluster.sh scale N [-y]   (1 <= N <= 10)"
+  preflight
+
+  if [ "$($TF state list 2>/dev/null | wc -l | tr -d ' ')" = "0" ]; then
+    set_tfvar worker_count "$want"
+    grn "No cluster running. Saved worker_count = $want; run ./cluster.sh up"
+    return 0
+  fi
+  have=$(worker_count_now)
+  if [ "$have" = "$want" ]; then
+    echo "Already $have workers; nothing to do."
+    set_tfvar worker_count "$want"
+    return 0
+  fi
+
+  # Plan first and refuse anything beyond adding/removing workers, e.g. a master
+  # replacement because a newer Ubuntu AMI was published or other edited settings.
+  bold "[1/4] terraform plan (worker_count $have -> $want)"
+  $TF init -input=false >/dev/null
+  $TF plan -input=false -out=tfplan -var "worker_count=$want" >/dev/null
+  if ! $TF show -json tfplan | python3 -c '
+import json, sys
+bad = []
+for rc in json.load(sys.stdin).get("resource_changes", []):
+    a = rc["change"]["actions"]
+    if a in (["no-op"], ["read"]):
+        continue
+    if rc["address"].startswith("aws_instance.k8s_worker[") and a in (["create"], ["delete"]):
+        continue
+    bad.append(rc["address"] + " (" + "/".join(a) + ")")
+if bad:
+    print("Plan would also change:\n  " + "\n  ".join(bad))
+    sys.exit(1)
+'; then
+    rm -f terraform/tfplan
+    die "refusing to scale; run 'terraform -chdir=terraform plan' to see why"
+  fi
+
+  if [ "$yes" != "-y" ]; then
+    if [ "$want" -lt "$have" ]; then
+      bold "This drains and DESTROYS worker$((want + 1))..worker$have."
+    else
+      bold "This creates $((want - have)) more worker(s) (each bills while running)."
+    fi
+    read -r -p "Continue? [y/N] " a
+    [[ "$a" =~ ^[Yy]$ ]] || { rm -f terraform/tfplan; echo "aborted"; exit 0; }
+  fi
+
+  # Terraform's count removes the highest indexes, i.e. inventory worker(want+1)..worker(have).
+  if [ "$want" -lt "$have" ]; then
+    bold "[2/4] drain and delete nodes"
+    for i in $(seq $((want + 1)) "$have"); do
+      node=$(cd ansible && ansible "worker$i" -m command -a hostname -o 2>/dev/null \
+             | sed -n 's/.*(stdout) //p')
+      [ -n "$node" ] || die "cannot reach worker$i to read its node name; fix or remove it manually"
+      (cd ansible && ansible master -b -m command -a \
+        "kubectl --kubeconfig /etc/kubernetes/admin.conf drain $node --ignore-daemonsets --delete-emptydir-data --timeout=300s") \
+        || die "drain of $node failed; nothing destroyed"
+      (cd ansible && ansible master -b -m command -a \
+        "kubectl --kubeconfig /etc/kubernetes/admin.conf delete node $node")
+      grn "removed node $node (worker$i)"
+    done
+  else
+    bold "[2/4] (scaling up: nothing to drain)"
+  fi
+
+  bold "[3/4] terraform apply"
+  set_tfvar worker_count "$want"   # keep later `up` runs from reverting the change
+  $TF apply -input=false tfplan
+  rm -f terraform/tfplan
+  refresh_inventory
+
+  if [ "$want" -gt "$have" ]; then
+    local new
+    new=$(seq -f 'worker%g' $((have + 1)) "$want" | paste -sd: -)
+    wait_for_ssh
+    bold "[4/4] install and join $new"
+    (cd ansible && ansible-playbook playbooks/01_deps.yml --limit "$new")
+    (cd ansible && ansible-playbook playbooks/02_k8s_init.yml --limit "masters:$new")
+    (cd ansible && ansible-playbook playbooks/03_cni.yml)
+  else
+    bold "[4/4] done"
+  fi
+  cmd_status
+}
+
 cmd_down() {
   if [ "${1:-}" != "-y" ]; then
     read -r -p "Destroy all infrastructure? [y/N] " a
@@ -933,7 +1072,8 @@ case "${1:-}" in
   status)    cmd_status ;;
   ssh)       cmd_ssh ;;
   inventory) refresh_inventory ;;
-  *) sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  scale)     shift; cmd_scale "${1:-}" "${2:-}" ;;
+  *) sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
 ```
 
