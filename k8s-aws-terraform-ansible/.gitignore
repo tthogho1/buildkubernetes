@@ -19,3 +19,11 @@ kubeconfig
 *.swp
 *.swo
 *~
+
+# Console build output
+console/console
+console/k8s-console
+console/k8s-console.exe
+console/dist/
+console/k8s-console-*.tar.gz
+console/k8s-console-*.zip

@@ -1,8 +1,7 @@
 - name: Install Kubernetes dependencies on all nodes
   hosts: all
   become: true
-  vars:
-    k8s_minor: "v1.31"
+  # k8s_minor comes from ansible/group_vars/all.yml
 
   tasks:
     # --- kubeadm prerequisites: swap off, kernel modules, sysctl ---

@@ -1,8 +1,7 @@
 - name: Apply CNI (Calico)
   hosts: masters
   become: true
-  vars:
-    calico_version: "v3.29.1" # Use a full tag including the patch version
+  # calico_version comes from ansible/group_vars/all.yml
   tasks:
     - name: Apply Calico manifest
       command: >

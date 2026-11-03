@@ -170,12 +170,14 @@ k8s-aws-terraform-ansible/
 ├─ ansible/
 │  ├─ ansible.cfg
 │  ├─ inventory.ini        # Replace the IPs with the terraform output values
+│  ├─ group_vars/all.yml   # k8s_minor, calico_version
 │  └─ playbooks/
 │     ├─ 01_deps.yml       # containerd + kubeadm/kubelet/kubectl
 │     ├─ 02_k8s_init.yml   # kubeadm init / join
 │     └─ 03_cni.yml        # Calico
 ├─ iam/
 │  └─ k8s-handson-policy.json   # Permissions for the executing IAM user
+├─ console/                     # Go + Fyne desktop app for editing settings (see below)
 ├─ cluster.sh                   # One-command wrapper (up / down / status / ssh)
 └─ README.md
 ```
@@ -246,6 +248,7 @@ Ansible separately:
 ./cluster.sh status    # kubectl get nodes / pods
 ./cluster.sh ssh       # SSH into the master
 ./cluster.sh down      # Destroy everything
+./cluster.sh scale 3   # Change the number of workers (drains removed nodes first)
 ```
 
 `up` runs preflight checks (required tools, SSH key, AWS credentials, and
@@ -256,6 +259,21 @@ add `-y` to skip that.
 
 `./cluster.sh inventory` refreshes just the inventory, which is useful if you
 applied by hand.
+
+`./cluster.sh scale N` changes the number of workers on a running cluster (1–10):
+
+- It plans with `worker_count=N` first, and refuses if the plan would change anything
+  other than adding or removing workers. One case is a master replacement because
+  Canonical published a newer Ubuntu AMI.
+- **Scaling down**: it runs `kubectl drain` and `kubectl delete node` on the
+  highest-numbered workers *before* Terraform destroys them.
+- **Scaling up**: it creates the new instances, refreshes the inventory, and runs the
+  playbooks only on the new workers (plus the master, to get a join token).
+- It saves `worker_count` to `terraform.tfvars`, so a later `up` doesn't undo the change.
+  If no cluster is running, it only saves the value.
+
+Don't change the count of a running cluster with a plain `up` or `terraform apply`: they
+destroy workers without draining them.
 
 The manual steps below do the same thing, one command at a time.
 
@@ -310,6 +328,58 @@ kubectl get pods -A
 cd terraform
 terraform destroy
 ```
+
+## Management console
+
+`console/` is a desktop app (Go + [Fyne](https://fyne.io)) that edits the cluster settings
+and runs checks. It writes **data files only**:
+
+| File | Fields |
+|---|---|
+| `terraform/terraform.tfvars` | `key_name`, `my_ip_cidr`, `master_instance_type`, `worker_instance_type`, `worker_count`, `root_volume_size` |
+| `ansible/group_vars/all.yml` | `k8s_minor`, `calico_version` |
+| `ansible/inventory.ini` (`[all:vars]` only) | `ansible_user`, `ansible_ssh_private_key_file` |
+
+`region`, the pod/VPC CIDRs and the AMI are shown read-only because other
+files pin them (IAM policy, `cluster.sh`, playbooks). Host IP lines are never written.
+
+```bash
+cd console
+go run .                 # opens the window (-root to override auto-detection)
+go test ./...            # includes a headless UI test (Fyne test driver)
+```
+
+Fyne needs cgo: on macOS the Xcode command-line tools are enough. On Linux, install a C
+compiler and the GL/X11 headers (`libgl1-mesa-dev xorg-dev`). The Docker toolchain image has
+no display, so run the console on the host.
+
+Prebuilt binaries for Linux (amd64/arm64), Windows (amd64) and macOS (universal) are built
+by `.github/workflows/console.yml` on every change to `console/`. Pushing a tag publishes them
+as a GitHub Release:
+
+```bash
+git tag console-v1.0.0 && git push origin console-v1.0.0
+```
+
+A downloaded binary finds the repo by itself: it tries `-root`, then the last folder used,
+the current directory, and the executable's folder. If none of those is the repo, it asks you
+to choose the folder. The macOS binary is unsigned: run
+`xattr -d com.apple.quarantine k8s-console` after extracting.
+
+- Tabs: **Settings** (the form, with an estimated $/day and live warnings), **Nodes &
+  read-only**, **Checks**.
+- **Nodes** compares what is deployed (from terraform state, not `inventory.ini`) with
+  `worker_count` in the form, and updates as you change it. Each worker shows `running`,
+  `will be added by ./cluster.sh scale N`, or `WILL BE REMOVED (drained)`. Rows whose
+  `inventory.ini` IP is out of date are flagged. With no cluster running, it lists what
+  `./cluster.sh up` would create.
+- **Save** checks every field first and writes only files whose content changes, atomically.
+  It then shows the diff. Comments and layout in `terraform.tfvars` are kept.
+- If `terraform.tfvars` is missing, the form loads `terraform.tfvars.example`, and **Save**
+  creates the file (mode 0600).
+- Check buttons: `terraform validate`, `terraform plan` (read-only AWS calls), and
+  `ansible-playbook --syntax-check` plus `ansible-inventory --host master`. The console
+  never runs `apply`, `destroy` or `cluster.sh`.
 
 ## Notes
 
